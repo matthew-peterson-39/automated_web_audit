@@ -1,18 +1,22 @@
-const puppeteer = require('puppeteer');
 const fs = require('fs').promises;
 const path = require('path');
 
 class WebsiteAuditor {
-    constructor() {
+    constructor(settings = {}) {
         this.browser = null;
         this.page = null;
+        this.settings = settings;
+        this.defaultViewport = { width: 1920, height: 1080 };
+        this.mobileViewport = { width: 375, height: 667 };
     }
 
     async initialize() {
         console.log('🚀 Launching browser...');
-        this.browser = await puppeteer.launch({ 
-            headless: false, // Set to true for production
-            defaultViewport: { width: 1920, height: 1080 },
+        const puppeteer = require('puppeteer');
+        
+        const browserSettings = this.settings.browser || {
+            headless: false,
+            defaultViewport: this.defaultViewport,
             args: [
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
@@ -22,25 +26,32 @@ class WebsiteAuditor {
                 '--no-zygote',
                 '--disable-gpu'
             ]
-        });
+        };
+
+        this.browser = await puppeteer.launch(browserSettings);
         this.page = await this.browser.newPage();
         
         // Set user agent to avoid bot detection
         await this.page.setUserAgent('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
         
-        // Set a reasonable timeout
-        this.page.setDefaultNavigationTimeout(30000);
-        this.page.setDefaultTimeout(30000);
+        // Set timeouts
+        const timeout = this.settings.audit?.navigationTimeout || 30000;
+        this.page.setDefaultNavigationTimeout(timeout);
+        this.page.setDefaultTimeout(timeout);
     }
 
     async auditWebsite(url) {
         console.log(`\n📊 Starting audit for: ${url}`);
         
         try {
-            // Create output directory
+            // Reset to desktop viewport at start of each audit
+            await this.page.setViewport(this.defaultViewport);
+            
+            // Create temporary output directory
             const siteName = new URL(url).hostname.replace(/\./g, '_');
-            const outputDir = `./audits/${siteName}_${Date.now()}`;
-            await fs.mkdir(outputDir, { recursive: true });
+            const timestamp = Date.now();
+            const tempOutputDir = `./audits/temp_${siteName}_${timestamp}`;
+            await fs.mkdir(tempOutputDir, { recursive: true });
 
             const auditData = {
                 url,
@@ -48,7 +59,9 @@ class WebsiteAuditor {
                 timestamp: new Date().toISOString(),
                 pages: [],
                 metrics: {},
-                issues: []
+                issues: [],
+                popups: null,
+                classification: null
             };
 
             // Navigate to main page
@@ -58,9 +71,22 @@ class WebsiteAuditor {
             // Check if it's a Shopify store
             const isShopify = await this.detectShopify();
             auditData.isShopify = isShopify;
-            
-            // Capture homepage
-            const homepageData = await this.capturePage('homepage', outputDir);
+
+            // Detect popups and email platforms FIRST (before any other captures)
+            console.log('🔍 Checking for popups and email platforms...');
+            const popupData = await this.detectPopupsAndEmailPlatforms();
+            auditData.popups = popupData;
+
+            // Determine classification and create final output directory
+            const popupFolder = popupData.hasPopup ? 'popup_detected' : 'no_popup';
+            const finalOutputDir = `./audits/${popupFolder}/${siteName}_${timestamp}`;
+            await fs.mkdir(finalOutputDir, { recursive: true });
+            auditData.classification = popupFolder;
+            auditData.outputDirectory = finalOutputDir;
+
+            // Capture homepage (desktop view)
+            console.log('🖥️ Capturing desktop homepage...');
+            const homepageData = await this.capturePage('homepage_desktop', finalOutputDir);
             auditData.pages.push(homepageData);
 
             // Get performance metrics
@@ -72,42 +98,234 @@ class WebsiteAuditor {
                 console.log('🛍️ E-commerce detected, finding product pages...');
                 const productLinks = await this.findProductPages();
                 
-                // Capture up to 3 product pages
+                // Capture up to 3 product pages (desktop)
                 for (let i = 0; i < Math.min(3, productLinks.length); i++) {
                     const productUrl = productLinks[i];
                     console.log(`📦 Capturing product page: ${productUrl}`);
                     
                     await this.page.goto(productUrl, { waitUntil: 'networkidle2', timeout: 30000 });
-                    const productData = await this.capturePage(`product_${i + 1}`, outputDir);
+                    const productData = await this.capturePage(`product_${i + 1}_desktop`, finalOutputDir);
                     auditData.pages.push(productData);
                 }
             }
 
-            // Capture mobile view of homepage
-            console.log('📱 Capturing mobile view...');
-            await this.page.setViewport({ width: 375, height: 667 });
+            // Switch to mobile view and capture
+            console.log('📱 Switching to mobile view...');
+            await this.page.setViewport(this.mobileViewport);
             await this.page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
-            const mobileData = await this.capturePage('mobile_homepage', outputDir);
+            const mobileData = await this.capturePage('homepage_mobile', finalOutputDir);
             auditData.pages.push(mobileData);
+
+            // Reset to desktop view for next audit
+            console.log('🖥️ Resetting to desktop view...');
+            await this.page.setViewport(this.defaultViewport);
 
             // Run automated checks
             auditData.issues = await this.runAutomatedChecks();
 
             // Generate audit report
-            await this.generateReport(auditData, outputDir);
+            await this.generateReport(auditData, finalOutputDir);
 
-            console.log(`✅ Audit complete! Results saved to: ${outputDir}`);
+            // Clean up temp directory
+            try {
+                await fs.rmdir(tempOutputDir);
+            } catch (error) {
+                // Temp directory might not exist or be empty, that's fine
+            }
+
+            console.log(`✅ Audit complete! Results saved to: ${finalOutputDir}`);
+            if (popupData.hasPopup) {
+                console.log(`📧 Popup detected: ${popupData.popupType} (Platform: ${popupData.emailPlatform || 'Unknown'})`);
+            }
+            
             return auditData;
 
         } catch (error) {
             console.error('❌ Error during audit:', error.message);
-            throw error;
+            
+            // Try to clean up temp directory if it exists
+            try {
+                await fs.rmdir(tempOutputDir).catch(() => {});
+            } catch (cleanupError) {
+                // Ignore cleanup errors
+            }
+            
+            // Return error info instead of throwing (so other audits can continue)
+            return {
+                url,
+                siteName,
+                timestamp: new Date().toISOString(),
+                error: error.message,
+                success: false
+            };
         }
+    }
+
+    async detectPopupsAndEmailPlatforms() {
+        const popupData = {
+            hasPopup: false,
+            popupType: null,
+            emailPlatform: null,
+            popupDetails: [],
+            emailPlatformDetails: []
+        };
+
+        try {
+            // Wait a bit for popups to potentially appear
+            const popupDelay = this.settings.audit?.popupDetectionDelay || 5000;
+            await new Promise(resolve => setTimeout(resolve, popupDelay));
+
+            // Detect email platforms first (they often load before popups)
+            const emailPlatforms = await this.page.evaluate(() => {
+                const platforms = [];
+                
+                // Klaviyo detection
+                if (window.klaviyo || window._learnq || document.querySelector('script[src*="klaviyo"]')) {
+                    platforms.push('Klaviyo');
+                }
+                
+                // Mailchimp detection
+                if (window.mc4wp || document.querySelector('script[src*="mailchimp"]') || 
+                    document.querySelector('[class*="mailchimp"], [id*="mailchimp"]')) {
+                    platforms.push('Mailchimp');
+                }
+                
+                // Omnisend detection
+                if (window.omnisend || document.querySelector('script[src*="omnisend"]')) {
+                    platforms.push('Omnisend');
+                }
+                
+                // Privy detection
+                if (window.privy || document.querySelector('script[src*="privy"]')) {
+                    platforms.push('Privy');
+                }
+                
+                // Justuno detection
+                if (window.ju || document.querySelector('script[src*="justuno"]')) {
+                    platforms.push('Justuno');
+                }
+                
+                // OptinMonster detection
+                if (window.om || document.querySelector('script[src*="optinmonster"]')) {
+                    platforms.push('OptinMonster');
+                }
+                
+                // Wisepops detection
+                if (window.wisepops || document.querySelector('script[src*="wisepops"]')) {
+                    platforms.push('Wisepops');
+                }
+                
+                // Sumo detection
+                if (window.sumo || document.querySelector('script[src*="sumo.com"]')) {
+                    platforms.push('Sumo');
+                }
+                
+                return platforms;
+            });
+
+            popupData.emailPlatformDetails = emailPlatforms;
+            popupData.emailPlatform = emailPlatforms.length > 0 ? emailPlatforms[0] : null;
+
+            // Detect popups/modals
+            const popupElements = await this.page.evaluate(() => {
+                const popups = [];
+                
+                // Common popup/modal selectors
+                const popupSelectors = [
+                    '[class*="popup"]',
+                    '[class*="modal"]',
+                    '[class*="overlay"]',
+                    '[class*="lightbox"]',
+                    '[id*="popup"]',
+                    '[id*="modal"]',
+                    '[class*="newsletter"]',
+                    '[class*="email-signup"]',
+                    '[class*="subscription"]',
+                    '[data-testid*="popup"]',
+                    '[data-testid*="modal"]',
+                    // Klaviyo specific
+                    '.klaviyo-form',
+                    '[class*="klaviyo"]',
+                    // Privy specific
+                    '.privy-popup',
+                    // Common exit intent/overlay patterns
+                    '[style*="position: fixed"]',
+                    '[style*="z-index: 999"]',
+                    '[style*="z-index: 9999"]'
+                ];
+                
+                popupSelectors.forEach(selector => {
+                    try {
+                        const elements = document.querySelectorAll(selector);
+                        elements.forEach(element => {
+                            const rect = element.getBoundingClientRect();
+                            const isVisible = rect.width > 0 && rect.height > 0 && 
+                                            window.getComputedStyle(element).display !== 'none' &&
+                                            window.getComputedStyle(element).visibility !== 'hidden';
+                            
+                            const hasEmailInput = element.querySelector('input[type="email"]');
+                            const text = element.textContent || '';
+                            const hasSubscribeText = text.toLowerCase().includes('subscribe') ||
+                                                   text.toLowerCase().includes('newsletter') ||
+                                                   text.toLowerCase().includes('email') ||
+                                                   text.toLowerCase().includes('discount') ||
+                                                   text.toLowerCase().includes('offer') ||
+                                                   text.toLowerCase().includes('save');
+                            
+                            if (isVisible && (hasEmailInput || hasSubscribeText) && text.length > 10) {
+                                popups.push({
+                                    selector: selector,
+                                    hasEmailInput: !!hasEmailInput,
+                                    text: text.substring(0, 200),
+                                    classes: element.className,
+                                    id: element.id,
+                                    width: Math.round(rect.width),
+                                    height: Math.round(rect.height)
+                                });
+                            }
+                        });
+                    } catch (error) {
+                        // Continue with other selectors if one fails
+                    }
+                });
+                
+                return popups;
+            });
+
+            if (popupElements.length > 0) {
+                popupData.hasPopup = true;
+                popupData.popupDetails = popupElements;
+                
+                // Classify popup type
+                const hasEmailInput = popupElements.some(p => p.hasEmailInput);
+                const hasDiscountText = popupElements.some(p => {
+                    const text = p.text.toLowerCase();
+                    return text.includes('discount') || 
+                           text.includes('save') ||
+                           text.includes('%') ||
+                           text.includes('off');
+                });
+                
+                if (hasEmailInput && hasDiscountText) {
+                    popupData.popupType = 'Email + Discount';
+                } else if (hasEmailInput) {
+                    popupData.popupType = 'Email Signup';
+                } else if (hasDiscountText) {
+                    popupData.popupType = 'Discount Offer';
+                } else {
+                    popupData.popupType = 'General Popup';
+                }
+            }
+
+        } catch (error) {
+            console.log('⚠️ Error during popup detection:', error.message);
+        }
+
+        return popupData;
     }
 
     async detectShopify() {
         try {
-            // Check for Shopify indicators
             const shopifyIndicators = await this.page.evaluate(() => {
                 return {
                     hasShopifyScript: !!document.querySelector('script[src*="shopify"]'),
@@ -142,7 +360,8 @@ class WebsiteAuditor {
 
     async findProductPages() {
         try {
-            const productLinks = await this.page.evaluate(() => {
+            const maxPages = this.settings.audit?.maxProductPages || 3;
+            const productLinks = await this.page.evaluate((maxPages) => {
                 const links = Array.from(document.querySelectorAll('a[href]'));
                 return links
                     .map(link => link.href)
@@ -155,8 +374,8 @@ class WebsiteAuditor {
                             url.includes('/store/')
                         ) && !url.includes('#') && href.startsWith('http');
                     })
-                    .slice(0, 5); // Limit to 5 potential product pages
-            });
+                    .slice(0, maxPages * 2); // Get extra in case some fail to load
+            }, maxPages);
             
             return [...new Set(productLinks)]; // Remove duplicates
         } catch (error) {
@@ -167,13 +386,15 @@ class WebsiteAuditor {
     async capturePage(pageName, outputDir) {
         const screenshotPath = path.join(outputDir, `${pageName}.png`);
         
-        // Wait for page to be fully loaded using standard setTimeout
-        await new Promise(resolve => setTimeout(resolve, 2000));
+        // Wait for page to be fully loaded
+        const pageLoadDelay = this.settings.audit?.pageLoadDelay || 2000;
+        await new Promise(resolve => setTimeout(resolve, pageLoadDelay));
         
         // Take full page screenshot
+        const screenshotSettings = this.settings.screenshot || { fullPage: true };
         await this.page.screenshot({ 
             path: screenshotPath, 
-            fullPage: true 
+            ...screenshotSettings
         });
 
         // Get page info
@@ -249,7 +470,8 @@ class WebsiteAuditor {
                 return navigation.loadEventEnd - navigation.fetchStart;
             });
             
-            if (loadTime > 3000) {
+            const slowThreshold = this.settings.performance?.slowLoadTime || 3000;
+            if (loadTime > slowThreshold) {
                 issues.push({ type: 'Performance', issue: `Slow page load time: ${Math.round(loadTime)}ms` });
             }
 
@@ -279,6 +501,8 @@ class WebsiteAuditor {
         .issue.Security { border-left-color: #fd7e14; background: #ffeaa7; }
         .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; }
         .metric { background: #f8f9fa; padding: 15px; border-radius: 5px; text-align: center; }
+        .popup-info { background: #e7f3ff; padding: 15px; border-radius: 5px; border-left: 4px solid #007bff; }
+        .popup-detail { background: #f8f9fa; padding: 10px; margin: 10px 0; border-radius: 3px; }
     </style>
 </head>
 <body>
@@ -287,7 +511,33 @@ class WebsiteAuditor {
         <p><strong>Site:</strong> ${auditData.url}</p>
         <p><strong>Generated:</strong> ${new Date(auditData.timestamp).toLocaleString()}</p>
         <p><strong>Platform:</strong> ${auditData.isShopify ? 'Shopify' : 'Unknown/Custom'}</p>
+        <p><strong>Classification:</strong> ${auditData.classification || 'Unknown'}</p>
+        ${auditData.popups ? `
+        <p><strong>Popup Detected:</strong> ${auditData.popups.hasPopup ? `Yes (${auditData.popups.popupType})` : 'No'}</p>
+        ${auditData.popups.emailPlatform ? `<p><strong>Email Platform:</strong> ${auditData.popups.emailPlatform}</p>` : ''}
+        ` : ''}
     </div>
+
+    ${auditData.popups && auditData.popups.hasPopup ? `
+    <div class="section">
+        <h2>Popup Analysis</h2>
+        <div class="popup-info">
+            <p><strong>Type:</strong> ${auditData.popups.popupType}</p>
+            <p><strong>Email Platform:</strong> ${auditData.popups.emailPlatform || 'Unknown'}</p>
+            ${auditData.popups.emailPlatformDetails.length > 1 ? `<p><strong>Additional Platforms:</strong> ${auditData.popups.emailPlatformDetails.slice(1).join(', ')}</p>` : ''}
+            <div class="popup-details">
+                <h3>Popup Details:</h3>
+                ${auditData.popups.popupDetails.map(popup => `
+                    <div class="popup-detail">
+                        <p><strong>Email Input:</strong> ${popup.hasEmailInput ? 'Yes' : 'No'}</p>
+                        <p><strong>Size:</strong> ${popup.width}x${popup.height}px</p>
+                        <p><strong>Preview:</strong> ${popup.text.substring(0, 100)}...</p>
+                    </div>
+                `).join('')}
+            </div>
+        </div>
+    </div>
+    ` : ''}
 
     <div class="section">
         <h2>Performance Metrics</h2>
@@ -308,6 +558,14 @@ class WebsiteAuditor {
                 <h3>${auditData.issues.length}</h3>
                 <p>Issues Found</p>
             </div>
+            <div class="metric">
+                <h3>${auditData.popups ? (auditData.popups.hasPopup ? 'Yes' : 'No') : 'Unknown'}</h3>
+                <p>Popup Detected</p>
+            </div>
+            <div class="metric">
+                <h3>${auditData.popups?.emailPlatform || 'None'}</h3>
+                <p>Email Platform</p>
+            </div>
         </div>
     </div>
 
@@ -324,7 +582,7 @@ class WebsiteAuditor {
         <h2>Screenshots</h2>
         ${auditData.pages.map(page => `
             <div>
-                <h3>${page.name} - ${page.title}</h3>
+                <h3>${page.name.replace(/_/g, ' ').toUpperCase()} - ${page.title}</h3>
                 <img src="${path.basename(page.screenshot)}" alt="${page.name}" class="screenshot">
             </div>
         `).join('')}
@@ -346,35 +604,4 @@ class WebsiteAuditor {
     }
 }
 
-// Main execution function
-async function runAudit() {
-    const websites = [
-        'https://o2trainer.com', // Your Shopify store
-        // Add more URLs as needed
-    ];
-
-    const auditor = new WebsiteAuditor();
-    
-    try {
-        await auditor.initialize();
-        
-        for (const url of websites) {
-            await auditor.auditWebsite(url);
-            // Add delay between audits to be respectful
-            await new Promise(resolve => setTimeout(resolve, 2000));
-        }
-        
-    } catch (error) {
-        console.error('Audit failed:', error);
-    } finally {
-        await auditor.close();
-    }
-}
-
-// Export for use as a module
-module.exports = { WebsiteAuditor, runAudit };
-
-// Run if called directly
-if (require.main === module) {
-    runAudit();
-}
+module.exports = { WebsiteAuditor };

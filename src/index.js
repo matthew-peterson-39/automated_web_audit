@@ -26,18 +26,39 @@ async function main() {
   try {
     await auditor.initialize();
     
+    const results = [];
+    
     for (const url of websites) {
-      await auditor.auditWebsite(url);
-      
-      // Add delay between audits to be respectful
-      if (settings.audit.delayBetweenAudits > 0) {
-        await new Promise(resolve => 
-          setTimeout(resolve, settings.audit.delayBetweenAudits)
-        );
+      try {
+        const result = await auditor.auditWebsite(url);
+        results.push(result);
+        
+        // Add delay between audits to be respectful
+        if (settings.audit.delayBetweenAudits > 0) {
+          await new Promise(resolve => 
+            setTimeout(resolve, settings.audit.delayBetweenAudits)
+          );
+        }
+      } catch (error) {
+        console.error(`❌ Failed to audit ${url}:`, error.message);
+        results.push({
+          url,
+          error: error.message,
+          success: false
+        });
+        // Continue with next website instead of stopping
       }
     }
     
-    console.log('\n✅ All audits completed successfully!');
+    // Summary
+    const successful = results.filter(r => r.success !== false).length;
+    const failed = results.length - successful;
+    
+    console.log('\n📊 Audit Summary:');
+    console.log(`✅ Successful: ${successful}`);
+    if (failed > 0) {
+      console.log(`❌ Failed: ${failed}`);
+    }
     console.log('📁 Check the ./audits/ directory for results.');
     
   } catch (error) {

@@ -23,8 +23,8 @@ A powerful Node.js tool that automatically audits websites for SEO, performance,
 ### Installation
 
 ```bash
-git clone https://github.com/matthew-peterson-39/automated_web_audit.git
-cd automated-web-auditor
+git clone https://github.com/yourusername/automated-website-auditor.git
+cd automated-website-auditor
 npm install
 ```
 

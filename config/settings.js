@@ -19,13 +19,15 @@ module.exports = {
     navigationTimeout: 30000,
     pageLoadDelay: 2000,
     popupDetectionDelay: 5000,
-    maxProductPages: 3
+    maxProductPages: 3,
+    delayBetweenAudits: 2000
   },
 
-  // Screenshot settings
+  // Screenshot settings - CLEAN VERSION (no quality setting)
   screenshot: {
-    fullPage: true,
-    quality: 85
+    fullPage: true
+    // PNG format is default and doesn't support quality
+    // For JPEG with quality: { format: 'jpeg', quality: 85, fullPage: true }
   },
 
   // Performance thresholds
