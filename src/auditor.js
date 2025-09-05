@@ -43,13 +43,15 @@ class WebsiteAuditor {
     async auditWebsite(url) {
         console.log(`\n📊 Starting audit for: ${url}`);
         
+        // Extract siteName at the top for error handling
+        const siteName = new URL(url).hostname.replace(/\./g, '_');
+        const timestamp = Date.now();
+        
         try {
             // Reset to desktop viewport at start of each audit
             await this.page.setViewport(this.defaultViewport);
             
             // Create temporary output directory
-            const siteName = new URL(url).hostname.replace(/\./g, '_');
-            const timestamp = Date.now();
             const tempOutputDir = `./audits/temp_${siteName}_${timestamp}`;
             await fs.mkdir(tempOutputDir, { recursive: true });
 
@@ -126,12 +128,8 @@ class WebsiteAuditor {
             // Generate audit report
             await this.generateReport(auditData, finalOutputDir);
 
-            // Clean up temp directory
-            try {
-                await fs.rmdir(tempOutputDir);
-            } catch (error) {
-                // Temp directory might not exist or be empty, that's fine
-            }
+            // Clean up temp directory (more robust cleanup)
+            await this.cleanupSingleTempDirectory(tempOutputDir);
 
             console.log(`✅ Audit complete! Results saved to: ${finalOutputDir}`);
             if (popupData.hasPopup) {
@@ -144,11 +142,7 @@ class WebsiteAuditor {
             console.error('❌ Error during audit:', error.message);
             
             // Try to clean up temp directory if it exists
-            try {
-                await fs.rmdir(tempOutputDir).catch(() => {});
-            } catch (cleanupError) {
-                // Ignore cleanup errors
-            }
+            await this.cleanupSingleTempDirectory(tempOutputDir);
             
             // Return error info instead of throwing (so other audits can continue)
             return {
@@ -158,6 +152,20 @@ class WebsiteAuditor {
                 error: error.message,
                 success: false
             };
+        }
+    }
+
+    async cleanupSingleTempDirectory(tempDirPath) {
+        try {
+            // Check if directory exists before trying to remove it
+            await fs.access(tempDirPath);
+            await fs.rm(tempDirPath, { recursive: true, force: true });
+            console.log(`🧹 Cleaned up temporary directory: ${path.basename(tempDirPath)}`);
+        } catch (error) {
+            // Directory might not exist or already cleaned up, that's fine
+            if (error.code !== 'ENOENT') {
+                console.log(`⚠️ Could not clean temp directory: ${error.message}`);
+            }
         }
     }
 
@@ -386,33 +394,67 @@ class WebsiteAuditor {
     async capturePage(pageName, outputDir) {
         const screenshotPath = path.join(outputDir, `${pageName}.png`);
         
-        // Wait for page to be fully loaded
-        const pageLoadDelay = this.settings.audit?.pageLoadDelay || 2000;
-        await new Promise(resolve => setTimeout(resolve, pageLoadDelay));
-        
-        // Take full page screenshot
-        const screenshotSettings = this.settings.screenshot || { fullPage: true };
-        await this.page.screenshot({ 
-            path: screenshotPath, 
-            ...screenshotSettings
-        });
-
-        // Get page info
-        const pageInfo = await this.page.evaluate(() => {
-            return {
-                title: document.title,
-                url: window.location.href,
-                description: document.querySelector('meta[name="description"]')?.content || '',
-                h1: document.querySelector('h1')?.textContent || '',
-                loadTime: performance.now()
+        try {
+            // Wait for page to be fully loaded
+            const pageLoadDelay = this.settings.audit?.pageLoadDelay || 2000;
+            await new Promise(resolve => setTimeout(resolve, pageLoadDelay));
+            
+            // Take full page screenshot with PNG-compatible settings only
+            const screenshotSettings = {
+                path: screenshotPath,
+                fullPage: true
+                // Explicitly don't include any other settings that might cause issues
             };
-        });
+            
+            await this.page.screenshot(screenshotSettings);
 
-        return {
-            name: pageName,
-            screenshot: screenshotPath,
-            ...pageInfo
-        };
+            // Get page info
+            const pageInfo = await this.page.evaluate(() => {
+                return {
+                    title: document.title,
+                    url: window.location.href,
+                    description: document.querySelector('meta[name="description"]')?.content || '',
+                    h1: document.querySelector('h1')?.textContent || '',
+                    loadTime: performance.now()
+                };
+            });
+
+            return {
+                name: pageName,
+                screenshot: screenshotPath,
+                ...pageInfo
+            };
+        } catch (error) {
+            console.error(`⚠️ Error capturing ${pageName}:`, error.message);
+            
+            // Return basic info even if screenshot fails
+            try {
+                const pageInfo = await this.page.evaluate(() => {
+                    return {
+                        title: document.title,
+                        url: window.location.href,
+                        description: document.querySelector('meta[name="description"]')?.content || '',
+                        h1: document.querySelector('h1')?.textContent || '',
+                        loadTime: performance.now()
+                    };
+                });
+
+                return {
+                    name: pageName,
+                    screenshot: null,
+                    error: error.message,
+                    ...pageInfo
+                };
+            } catch (pageError) {
+                return {
+                    name: pageName,
+                    screenshot: null,
+                    error: error.message,
+                    title: 'Error loading page',
+                    url: 'Unknown'
+                };
+            }
+        }
     }
 
     async getPerformanceMetrics() {
@@ -597,7 +639,55 @@ class WebsiteAuditor {
         await fs.writeFile(jsonPath, JSON.stringify(auditData, null, 2));
     }
 
+    async cleanupTempDirectories() {
+        console.log('🧹 Cleaning up temporary directories...');
+        
+        try {
+            const auditsDir = './audits';
+            
+            // Check if audits directory exists
+            try {
+                await fs.access(auditsDir);
+            } catch (error) {
+                // Audits directory doesn't exist, nothing to clean
+                return;
+            }
+
+            // Read all items in the audits directory
+            const items = await fs.readdir(auditsDir, { withFileTypes: true });
+            
+            let cleanedCount = 0;
+            
+            for (const item of items) {
+                if (item.isDirectory() && item.name.startsWith('temp_')) {
+                    const tempDirPath = path.join(auditsDir, item.name);
+                    
+                    try {
+                        // Remove directory and all its contents
+                        await fs.rm(tempDirPath, { recursive: true, force: true });
+                        console.log(`   ✅ Removed: ${item.name}`);
+                        cleanedCount++;
+                    } catch (error) {
+                        console.log(`   ⚠️ Could not remove ${item.name}: ${error.message}`);
+                    }
+                }
+            }
+            
+            if (cleanedCount > 0) {
+                console.log(`🧹 Cleanup complete: ${cleanedCount} temporary directories removed`);
+            } else {
+                console.log('✨ No temporary directories found to clean');
+            }
+            
+        } catch (error) {
+            console.log('⚠️ Error during cleanup:', error.message);
+        }
+    }
+
     async close() {
+        // Clean up temporary directories before closing
+        await this.cleanupTempDirectories();
+        
         if (this.browser) {
             await this.browser.close();
         }
