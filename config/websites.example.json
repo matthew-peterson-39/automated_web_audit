@@ -1,0 +1,15 @@
+{
+  "websites": [
+    "https://demo.vercel.store",
+    "https://example-store.myshopify.com"
+  ],
+  "settings": {
+    "maxConcurrent": 1,
+    "delayBetweenAudits": 2000,
+    "screenshotQuality": 85,
+    "mobileViewport": {
+      "width": 375,
+      "height": 667
+    }
+  }
+}

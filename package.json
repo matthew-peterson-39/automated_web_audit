@@ -1,0 +1,29 @@
+{
+  "name": "automated-website-auditor",
+  "version": "1.0.0",
+  "description": "Automated website audit tool for SEO, performance, and e-commerce optimization",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "audit": "node src/index.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "website-audit",
+    "seo",
+    "performance",
+    "accessibility",
+    "puppeteer",
+    "automation",
+    "freelance",
+    "web-development"
+  ],
+  "author": "Your Name",
+  "license": "MIT",
+  "dependencies": {
+    "puppeteer": "^21.0.0"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  }
+}
